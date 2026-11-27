@@ -35,6 +35,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import json
 import os
 import sys
 import time
@@ -91,6 +92,19 @@ os.environ["AW_WORKSPACE"] = f"presentations-relay-test-{uuid.uuid4().hex[:8]}"
 from presentations_app import routes as routes_mod  # noqa: E402
 from presentations_app.storage import PresentationStore  # noqa: E402
 from tests.test_storage_and_routes import FakeDb  # noqa: E402
+
+
+@pytest.fixture(autouse=True)
+def _pin_ctx_state_to_probed_redis(monkeypatch):
+    """``ctx.state`` resolves its endpoint via ``AW_WORKSPACE_REDIS_URL`` then
+    ``AW_REDIS_URL`` — it does NOT read ``AW_TEST_REDIS_URL``, which the
+    availability probe above honours. Pin the facade to the very URL the
+    probe pinged (so the two can never disagree) and drop its process-wide
+    cached client so it reconnects there rather than at an earlier endpoint."""
+    import src.apps.state_facade as state_facade
+
+    monkeypatch.setenv("AW_WORKSPACE_REDIS_URL", _redis_url())
+    monkeypatch.setattr(state_facade, "_client", None)
 
 
 class SharedCtx:
@@ -221,7 +235,7 @@ def test_create_on_one_worker_is_broadcast_to_another(tmp_path):
         assert msg["presentation"]["id"] == "recording-demo"
 
 
-def test_create_publishes_under_ctx_states_namespaced_broadcast_topic(tmp_path):
+def test_create_publishes_under_ctx_states_namespaced_broadcast_topic(tmp_path, monkeypatch):
     """Proves the PRODUCTION path actually goes through ``ctx.state.broadcast``
     rather than merely degrading to local-only without error (the WS-level
     regression test above can't tell those apart in THIS checkout, because
@@ -239,18 +253,23 @@ def test_create_publishes_under_ctx_states_namespaced_broadcast_topic(tmp_path):
     ``presentations:update`` topic instead — nothing ever arrives on
     ``app:presentations:update``, and this times out.
     """
-    os.environ["AW_WORKSPACE"] = f"presentations-ctxstate-topic-test-{time.time()}"
+    workspace = f"presentations-ctxstate-topic-test-{time.time()}"
+    monkeypatch.setenv("AW_WORKSPACE", workspace)
     db = FakeDb()
+    # The LITERAL wire channel: RedisBroadcaster's ``aw:ws:<ws>:bcast:`` prefix
+    # + ctx.state's ``app:<app_id>:<topic>``. Hard-coded on purpose — deriving
+    # it from broadcast_topic() on both ends would make this test agree with
+    # the helper even if the helper (or the store) used the wrong namespace.
+    channel = f"aw:ws:{workspace}:bcast:app:presentations:update"
 
     async def scenario():
+        import redis.asyncio as aioredis
+
         received: list[tuple[str, dict]] = []
-
-        async def _collect(payload):
-            received.append(("app:presentations:update", payload))
-
-        probe = SharedCtxWithState(db).state.broadcast
-        await probe.subscribe("update", _collect)
-        await asyncio.sleep(0.3)  # let the PSUBSCRIBE land
+        raw = aioredis.from_url(_redis_url(), decode_responses=True)
+        pubsub = raw.pubsub()
+        await pubsub.subscribe(channel)
+        await asyncio.sleep(0.3)  # let the SUBSCRIBE land
 
         store = PresentationStore(SharedCtxWithState(db))
         store.set_loop(asyncio.get_event_loop())
@@ -263,15 +282,17 @@ def test_create_publishes_under_ctx_states_namespaced_broadcast_topic(tmp_path):
         store.create(title="T", html="<p>x</p>", presentation_id="ctxstate-topic-demo")
 
         deadline = time.monotonic() + 5.0
-        while (time.monotonic() < deadline
-               and not any(t == "app:presentations:update" for t, _ in received)):
-            await asyncio.sleep(0.05)
+        while time.monotonic() < deadline and not received:
+            msg = await pubsub.get_message(ignore_subscribe_messages=True, timeout=0.2)
+            if msg is not None:
+                received.append((msg["channel"], json.loads(msg["data"])))
 
-        await probe.aclose()
+        await pubsub.aclose()
+        await raw.aclose()
         return received
 
     received = asyncio.run(scenario())
-    assert any(t == "app:presentations:update" for t, _ in received), (
-        "no message published under ctx.state's namespaced broadcast topic "
-        "(app:presentations:update) — storage.py is not actually using "
+    assert any(t == channel for t, _ in received), (
+        f"no message published on the literal channel {channel!r} "
+        "(ctx.state's namespaced broadcast topic app:presentations:update) — storage.py is not actually using "
         "ctx.state.broadcast for its relay")
