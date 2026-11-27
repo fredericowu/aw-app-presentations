@@ -26,7 +26,7 @@ now reaches the other worker's listener too.
 Needs a reachable Redis (``AW_TEST_REDIS_URL`` / ``AW_WORKSPACE_REDIS_URL`` /
 ``AW_REDIS_URL`` — same resolution order ``storage.py`` itself uses) AND
 aw-workspace core's own ``src`` package on ``sys.path``: ``storage.py``'s
-relay lazy-imports ``src.libs.redis_coord``, only importable when this app
+relay goes through ``ctx.state`` (core's ``src.apps``), only importable when this app
 is running INSIDE an aw-workspace checkout — not the case in this repo's own
 CI (no aw-workspace checkout, no Redis service), so this test skips cleanly
 there, same posture as ``apps/devctl/tests/test_relay_multiworker.py``.
@@ -35,6 +35,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import json
 import os
 import sys
 import time
@@ -48,7 +49,7 @@ ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 
 _WORKSPACE_ROOT = Path(os.environ.get("AW_WORKSPACE_CONTAINER_DIR", "/opt/aw-workspace"))
-if (_WORKSPACE_ROOT / "src" / "libs" / "redis_coord.py").is_file():
+if (_WORKSPACE_ROOT / "src" / "apps" / "base.py").is_file():
     sys.path.insert(0, str(_WORKSPACE_ROOT))
 
 
@@ -62,7 +63,7 @@ def _redis_url() -> str:
 
 def _src_available() -> bool:
     try:
-        import src.libs.redis_coord  # noqa: F401
+        import src.apps.base  # noqa: F401
         return True
     except Exception:
         return False
@@ -91,6 +92,19 @@ os.environ["AW_WORKSPACE"] = f"presentations-relay-test-{uuid.uuid4().hex[:8]}"
 from presentations_app import routes as routes_mod  # noqa: E402
 from presentations_app.storage import PresentationStore  # noqa: E402
 from tests.test_storage_and_routes import FakeDb  # noqa: E402
+
+
+@pytest.fixture(autouse=True)
+def _pin_ctx_state_to_probed_redis(monkeypatch):
+    """``ctx.state`` resolves its endpoint via ``AW_WORKSPACE_REDIS_URL`` then
+    ``AW_REDIS_URL`` — it does NOT read ``AW_TEST_REDIS_URL``, which the
+    availability probe above honours. Pin the facade to the very URL the
+    probe pinged (so the two can never disagree) and drop its process-wide
+    cached client so it reconnects there rather than at an earlier endpoint."""
+    import src.apps.state_facade as state_facade
+
+    monkeypatch.setenv("AW_WORKSPACE_REDIS_URL", _redis_url())
+    monkeypatch.setattr(state_facade, "_client", None)
 
 
 class SharedCtx:
@@ -141,15 +155,10 @@ def _worker(db, tmp_path):
     test exercises. A bare ``TestClient(app)`` with no ``with`` never binds
     the loop at all, which would make this test pass for the wrong reason.
 
-    Passes a real ``RedisBroadcaster`` explicitly rather than relying on
-    ``PresentationStore``'s own default (``ctx.state.broadcast``, which
-    needs a granted ``state:own`` capability ``SharedCtx`` doesn't carry) —
-    this test's job is to prove the underlying Redis primitive the facade
-    wraps still delivers cross-worker, same posture as
-    ``apps/devctl/tests/test_relay_multiworker.py``."""
-    from src.libs.redis_coord import RedisBroadcaster
-
-    store = PresentationStore(SharedCtx(db), broadcaster=RedisBroadcaster(_redis_url()))
+    Uses ``SharedCtxWithState`` — a real, granted ``ctx.state`` — so the
+    store takes its production default (``ctx.state.broadcast``) and each
+    simulated worker has its own facade/broadcaster over the one Redis."""
+    store = PresentationStore(SharedCtxWithState(db))
     app = routes_mod.build_app(store, str(tmp_path))
     with TestClient(app) as client:
         yield store, client
@@ -226,37 +235,41 @@ def test_create_on_one_worker_is_broadcast_to_another(tmp_path):
         assert msg["presentation"]["id"] == "recording-demo"
 
 
-def test_create_publishes_under_ctx_states_namespaced_broadcast_topic(tmp_path):
+def test_create_publishes_under_ctx_states_namespaced_broadcast_topic(tmp_path, monkeypatch):
     """Proves the PRODUCTION path actually goes through ``ctx.state.broadcast``
     rather than merely degrading to local-only without error (the WS-level
     regression test above can't tell those apart in THIS checkout, because
-    ``src.libs.redis_coord`` is reachable here either way — the old direct
-    import still works against a real Redis, just at the wrong layer).
+    core's Redis is reachable here either way — a direct broadcaster would
+    still work against a real Redis, just at the wrong layer).
 
     ``ctx.state.broadcast`` namespaces every topic under ``app:<app_id>:``
     (``src/apps/state_facade.py::broadcast_topic``) — a real, observable
     difference from the old ad hoc ``_RELAY_TOPIC = "presentations:update"``
-    channel. Subscribe directly to the NEW channel with a raw
-    ``RedisBroadcaster`` (PSUBSCRIBEs every topic, like the real cross-worker
-    relay) and prove a ``create()`` reaches it. Fails against the
+    channel. Subscribe to the NEW channel through a second, independent
+    ``ctx.state.broadcast`` (the same topic name resolves to
+    ``app:presentations:update``, and delivery only happens if the store
+    published under that exact namespaced channel) and prove a ``create()`` reaches it. Fails against the
     pre-migration module, which publishes to the OLD un-namespaced
     ``presentations:update`` topic instead — nothing ever arrives on
     ``app:presentations:update``, and this times out.
     """
-    from src.libs.redis_coord import RedisBroadcaster
-
-    os.environ["AW_WORKSPACE"] = f"presentations-ctxstate-topic-test-{time.time()}"
+    workspace = f"presentations-ctxstate-topic-test-{time.time()}"
+    monkeypatch.setenv("AW_WORKSPACE", workspace)
     db = FakeDb()
+    # The LITERAL wire channel: RedisBroadcaster's ``aw:ws:<ws>:bcast:`` prefix
+    # + ctx.state's ``app:<app_id>:<topic>``. Hard-coded on purpose — deriving
+    # it from broadcast_topic() on both ends would make this test agree with
+    # the helper even if the helper (or the store) used the wrong namespace.
+    channel = f"aw:ws:{workspace}:bcast:app:presentations:update"
 
     async def scenario():
+        import redis.asyncio as aioredis
+
         received: list[tuple[str, dict]] = []
-
-        async def _collect(topic, payload):
-            received.append((topic, payload))
-
-        probe = RedisBroadcaster(_redis_url())
-        await probe.start_relay(_collect)
-        await asyncio.sleep(0.3)  # let the PSUBSCRIBE land
+        raw = aioredis.from_url(_redis_url(), decode_responses=True)
+        pubsub = raw.pubsub()
+        await pubsub.subscribe(channel)
+        await asyncio.sleep(0.3)  # let the SUBSCRIBE land
 
         store = PresentationStore(SharedCtxWithState(db))
         store.set_loop(asyncio.get_event_loop())
@@ -269,15 +282,17 @@ def test_create_publishes_under_ctx_states_namespaced_broadcast_topic(tmp_path):
         store.create(title="T", html="<p>x</p>", presentation_id="ctxstate-topic-demo")
 
         deadline = time.monotonic() + 5.0
-        while (time.monotonic() < deadline
-               and not any(t == "app:presentations:update" for t, _ in received)):
-            await asyncio.sleep(0.05)
+        while time.monotonic() < deadline and not received:
+            msg = await pubsub.get_message(ignore_subscribe_messages=True, timeout=0.2)
+            if msg is not None:
+                received.append((msg["channel"], json.loads(msg["data"])))
 
-        await probe.stop()
+        await pubsub.aclose()
+        await raw.aclose()
         return received
 
     received = asyncio.run(scenario())
-    assert any(t == "app:presentations:update" for t, _ in received), (
-        "no message published under ctx.state's namespaced broadcast topic "
-        "(app:presentations:update) — storage.py is not actually using "
+    assert any(t == channel for t, _ in received), (
+        f"no message published on the literal channel {channel!r} "
+        "(ctx.state's namespaced broadcast topic app:presentations:update) — storage.py is not actually using "
         "ctx.state.broadcast for its relay")
